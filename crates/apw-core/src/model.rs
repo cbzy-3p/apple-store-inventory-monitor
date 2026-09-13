@@ -252,6 +252,7 @@ impl Region {
             "zh_HK" => "zh-HK,zh;q=0.9",
             "zh_TW" => "zh-TW,zh;q=0.9",
             "ja_JP" => "ja-JP,ja;q=0.9",
+            "en_CA" => "en-CA,en;q=0.9",
             _ => "en-US,en;q=0.9",
         }
     }
@@ -389,6 +390,12 @@ pub const REGIONS: &[Region] = &[
         title: "Malaysia",
         locale: "en_MY",
         base_url: "https://www.apple.com/my",
+        families: DEFAULT_FAMILIES,
+    },
+    Region {
+        title: "Canada",
+        locale: "en_CA",
+        base_url: "https://www.apple.com/ca",
         families: DEFAULT_FAMILIES,
     },
 ];
@@ -538,7 +545,9 @@ mod tests {
 
     #[test]
     fn 地区表里每个站点都能拼出接口地址() {
-        assert_eq!(REGIONS.len(), 7);
+        assert_eq!(REGIONS.len(), 8);
+        let canada = region_by_locale("en_CA").expect("地区表里应当有加拿大");
+        assert_eq!(canada.accept_language(), "en-CA,en;q=0.9");
         let cn = region_by_locale("zh_CN").expect("地区表里应当有中国大陆");
         assert_eq!(
             cn.pickup_message_url(),

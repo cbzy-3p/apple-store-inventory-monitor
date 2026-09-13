@@ -47,9 +47,9 @@ const SELECTION: &str = r#"{
 // ---- 内嵌数据 ----
 
 #[test]
-fn 七个地区都能从内嵌数据读出商品与门店() {
+fn 八个地区都能从内嵌数据读出商品与门店() {
     let catalog = Catalog::new();
-    assert_eq!(REGIONS.len(), 7);
+    assert_eq!(REGIONS.len(), 8);
 
     for region in REGIONS {
         let products = catalog
@@ -489,4 +489,15 @@ fn 地区表与内嵌数据一一对应() {
             region.locale
         );
     }
+}
+
+#[test]
+fn 加拿大内嵌门店包含官网直营店() {
+    let catalog = Catalog::new();
+    let stores = catalog.stores("en_CA").expect("加拿大门店数据应当可用");
+    assert_eq!(stores.len(), 28);
+    let pacific_centre = catalog
+        .store_by_number("en_CA", "R280")
+        .expect("加拿大应当有 Pacific Centre");
+    assert_eq!(pacific_centre.title, "British Columbia-Pacific Centre");
 }
