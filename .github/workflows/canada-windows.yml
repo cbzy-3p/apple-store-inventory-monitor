@@ -1,0 +1,215 @@
+name: Build Canada Windows installer
+
+on:
+  push:
+    branches: [canada-support]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: canada-windows-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: canada-support
+
+      - name: Add Canada source support and current Apple data
+        shell: python
+        run: |
+          from pathlib import Path
+          import importlib.util
+          import json
+          import urllib.request
+
+          def edit(path, old, new):
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{path}: expected one match, found {count}")
+              file.write_text(text.replace(old, new), encoding="utf-8")
+
+          edit(
+              "crates/apw-core/src/model.rs",
+              '            "ja_JP" => "ja-JP,ja;q=0.9",\n            _ => "en-US,en;q=0.9",',
+              '            "ja_JP" => "ja-JP,ja;q=0.9",\n            "en_CA" => "en-CA,en;q=0.9",\n            _ => "en-US,en;q=0.9",',
+          )
+          edit(
+              "crates/apw-core/src/model.rs",
+              '''    Region {
+                  title: "Malaysia",
+                  locale: "en_MY",
+                  base_url: "https://www.apple.com/my",
+                  families: DEFAULT_FAMILIES,
+              },
+          ];''',
+              '''    Region {
+                  title: "Malaysia",
+                  locale: "en_MY",
+                  base_url: "https://www.apple.com/my",
+                  families: DEFAULT_FAMILIES,
+              },
+              Region {
+                  title: "Canada",
+                  locale: "en_CA",
+                  base_url: "https://www.apple.com/ca",
+                  families: DEFAULT_FAMILIES,
+              },
+          ];''',
+          )
+          edit(
+              "crates/apw-core/src/model.rs",
+              "        assert_eq!(REGIONS.len(), 7);",
+              '''        assert_eq!(REGIONS.len(), 8);
+                  let canada = region_by_locale("en_CA").expect("地区表里应当有加拿大");
+                  assert_eq!(canada.accept_language(), "en-CA,en;q=0.9");''',
+          )
+          edit(
+              "crates/apw-core/src/catalog.rs",
+              '    ("en_MY", include_str!("../data/products_en_MY.json")),\n];',
+              '    ("en_MY", include_str!("../data/products_en_MY.json")),\n    ("en_CA", include_str!("../data/products_en_CA.json")),\n];',
+          )
+          edit(
+              "crates/apw-core/data/generate.py",
+              '    "en_MY": ("https://www.apple.com/my", "en-US,en;q=0.9"),\n}',
+              '    "en_MY": ("https://www.apple.com/my", "en-US,en;q=0.9"),\n    "en_CA": ("https://www.apple.com/ca", "en-CA,en;q=0.9"),\n}',
+          )
+          edit(
+              "crates/apw-core/tests/catalog.rs",
+              "fn 七个地区都能从内嵌数据读出商品与门店() {\n    let catalog = Catalog::new();\n    assert_eq!(REGIONS.len(), 7);",
+              "fn 八个地区都能从内嵌数据读出商品与门店() {\n    let catalog = Catalog::new();\n    assert_eq!(REGIONS.len(), 8);",
+          )
+          with Path("crates/apw-core/tests/catalog.rs").open("a", encoding="utf-8") as file:
+              file.write('''
+          #[test]
+          fn 加拿大内嵌门店包含官网直营店() {
+              let catalog = Catalog::new();
+              let stores = catalog.stores("en_CA").expect("加拿大门店数据应当可用");
+              assert_eq!(stores.len(), 28);
+              let pacific_centre = catalog
+                  .store_by_number("en_CA", "R280")
+                  .expect("加拿大应当有 Pacific Centre");
+              assert_eq!(pacific_centre.title, "British Columbia-Pacific Centre");
+          }
+          ''')
+          edit(
+              "crates/apw-core/tests/watch_models.rs",
+              "fn 七个地区的当前手表目录保留官方代数()",
+              "fn 八个地区的当前手表目录保留官方代数()",
+          )
+          edit(
+              "crates/apw-core/tests/purchase_links.rs",
+              '        ("en_MY", "https://www.apple.com/my"),',
+              '        ("en_MY", "https://www.apple.com/my"),\n        ("en_CA", "https://www.apple.com/ca"),',
+          )
+          edit(
+              "crates/apw-core/tests/live.rs",
+              '    ("en_MY", "R742", "MG6L4X/A"),',
+              '    ("en_MY", "R742", "MG6L4X/A"),\n    ("en_CA", "R280", "MG674VC/A"),',
+          )
+          edit(
+              "crates/apw-core/tests/live.rs",
+              "async fn 七个地区的接口都还能用()",
+              "async fn 八个地区的接口都还能用()",
+          )
+          edit(
+              "README.md",
+              "内置中国大陆、中国香港、中国台湾、日本、新加坡、澳大利亚和马来西亚的 Apple Store 列表。",
+              "内置中国大陆、中国香港、中国台湾、日本、新加坡、澳大利亚、马来西亚和加拿大的 Apple Store 列表。",
+          )
+          edit(
+              "CHANGELOG.md",
+              "## 1.0.5\n",
+              "## 1.0.5\n\n- 新增加拿大地区，内置官网当前 28 家 Apple Store 和离线商品目录，并支持加拿大站目录刷新、库存查询及购物袋跳转。",
+          )
+
+          request = urllib.request.Request(
+              "https://www.apple.com/ca/retail/storelist/",
+              headers={"User-Agent": "Mozilla/5.0"},
+          )
+          html = urllib.request.urlopen(request, timeout=60).read().decode("utf-8")
+          marker = '<script id="__NEXT_DATA__" type="application/json">'
+          start = html.index(marker) + len(marker)
+          end = html.index("</script>", start)
+          store_list = json.loads(html[start:end])["props"]["pageProps"]["storeList"]
+          canada = next(region for region in store_list if region["locale"] == "en_CA")
+          stores_path = Path("crates/apw-core/data/stores.json")
+          stores = json.loads(stores_path.read_text(encoding="utf-8"))
+          if any(region.get("locale") == "en_CA" for region in stores):
+              raise RuntimeError("Canada already exists in stores.json")
+          stores.append(canada)
+          stores_path.write_text(json.dumps(stores, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+          generator_path = Path("crates/apw-core/data/generate.py")
+          spec = importlib.util.spec_from_file_location("generate", generator_path)
+          generator = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(generator)
+          generator.REGIONS = {"en_CA": ("https://www.apple.com/ca", "en-CA,en;q=0.9")}
+          if generator.main() != 0:
+              raise RuntimeError("Canadian product snapshot generation failed")
+
+      - name: Commit Canada source changes
+        shell: pwsh
+        run: |
+          git config user.name "Codex Canada Builder"
+          git config user.email "actions@users.noreply.github.com"
+          git add CHANGELOG.md README.md crates/apw-core
+          git commit -m "feat: add Canada inventory monitoring [skip ci]"
+          git push origin canada-support
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "9"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify source
+        shell: pwsh
+        run: |
+          cargo fmt --all --check
+          python crates/apw-core/data/generate.py --self-test
+          pnpm test
+          pnpm exec tsc --noEmit
+          cargo test -p apw-core
+
+      - name: Disable signed updater artifacts for this unsigned custom build
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+          path = Path("src-tauri/tauri.conf.json")
+          data = json.loads(path.read_text(encoding="utf-8"))
+          data["bundle"]["createUpdaterArtifacts"] = False
+          path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+      - name: Build Windows NSIS installer
+        run: pnpm tauri build --bundles nsis
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v6
+        with:
+          name: apple-store-inventory-monitor-canada-windows
+          path: target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
