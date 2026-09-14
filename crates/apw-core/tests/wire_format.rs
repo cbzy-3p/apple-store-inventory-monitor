@@ -101,6 +101,9 @@ fn 跨边界的结构统一用小驼峰() {
         store_title: "上海-环球港".into(),
         part_number: "MG724CH/A".into(),
         product_name: "iPhone 17 512GB 黑色".into(),
+        companion_part: None,
+        companion_name: None,
+        kit_part: None,
     };
     assert_eq!(
         to_value(&target),
@@ -120,6 +123,9 @@ fn 跨边界的结构统一用小驼峰() {
         capacity: "512GB".into(),
         color: "黑色".into(),
         title: "iPhone 17 512GB 黑色".into(),
+        companion_part: None,
+        kit_part: None,
+        watch_case_size: None,
     };
     let v = to_value(&product);
     assert!(v.get("partNumber").is_some(), "Product 应当用小驼峰：{v}");
@@ -208,6 +214,9 @@ fn 监控目标能原样往返() {
         store_title: "東京-渋谷".into(),
         part_number: "MG6A4J/A".into(),
         product_name: "iPhone 17 256GB ラベンダー".into(),
+        companion_part: None,
+        companion_name: None,
+        kit_part: None,
     };
     let json = serde_json::to_string(&target).unwrap();
     let back: Target = serde_json::from_str(&json).expect("反序列化失败");

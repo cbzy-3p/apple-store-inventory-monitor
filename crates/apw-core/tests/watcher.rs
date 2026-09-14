@@ -62,8 +62,13 @@ impl Fetcher for FakeFetcher {
         &self,
         _region: &'static Region,
         store_number: &str,
-        parts: &[String],
+        targets: &[Target],
+        _delivery_region: Option<&apw_core::model::DeliveryRegion>,
     ) -> Result<StoreAvailability, ApiError> {
+        let parts: Vec<String> = targets
+            .iter()
+            .map(|target| target.part_number.clone())
+            .collect();
         let nth = self.calls.fetch_add(1, Ordering::SeqCst);
         // 必须用 guard 来减计数，不能在函数末尾手动减。
         //
@@ -71,10 +76,10 @@ impl Fetcher for FakeFetcher {
         // 根本没机会执行，计数会一路泄漏 —— 第一版就是这么写的，结果峰值恰好
         // 等于循环次数，看上去像引擎跑出了二十条循环。Drop 在取消路径上照样执行。
         let _guard = InFlightGuard::enter(&self.in_flight, &self.peak);
-        self.seen_parts.lock().await.push(parts.to_vec());
+        self.seen_parts.lock().await.push(parts.clone());
 
         tokio::time::sleep(self.delay).await;
-        (self.responder)(nth, store_number, parts)
+        (self.responder)(nth, store_number, &parts)
     }
 }
 
@@ -127,6 +132,9 @@ fn target(store: &str, part: &str) -> Target {
         store_title: format!("上海-{store}"),
         part_number: part.into(),
         product_name: format!("型号 {part}"),
+        companion_part: None,
+        companion_name: None,
+        kit_part: None,
     }
 }
 
@@ -136,6 +144,7 @@ fn fast_config() -> WatcherConfig {
         jitter: 0.0,
         concurrency: 4,
         event_buffer: 256,
+        delivery_region: None,
     }
 }
 

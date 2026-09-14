@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { describeCycleRow, describeCycleSummary, describeMonitorStatus } from "../src/lib/monitorLog.ts";
+import { describeCycleRow, describeCycleSummary, describeDelivery, describeMonitorStatus, describePickupDate } from "../src/lib/monitorLog.ts";
 const target = { storeTitle: "上海-南京东路", storeNumber: "R359", productName: "iPhone", partNumber: "MJTJ4CH/A", locale: "zh_CN" };
 const row = (availability, pickupDetails) => ({ target, availability, pickupDetails });
 const unavailable = {kind:"out_of_stock"};
@@ -39,4 +39,38 @@ test("Duo 即将发售与18 Pro暂未开售分别显示，日志保留原始区�
   assert.equal(pro.tone,"presale");
   assert.match(describeCycleRow(1,duo), /COMING_SOON.*暂无供应/);
   assert.equal(describeMonitorStatus(row({kind:"in_stock"},duo.pickupDetails)).label,"有货");
+});
+
+test("送货日期按速度分色，并同时给出非颜色文字提示", () => {
+  const checkedAt = new Date(2026, 8, 14, 19, 1, 20).getTime();
+  assert.deepEqual(describeDelivery({saleMessage:"2026/10/14 — 免费"},checkedAt),{
+    label:"10/14",timing:"30 天后",tone:"later",detail:"2026/10/14 — 免费"
+  });
+  assert.deepEqual(describeDelivery({saleMessage:"2026/09/16 – 2026/09/18 — 免费"},checkedAt),{
+    label:"9/16 – 9/18",timing:"2 天后",tone:"soon",detail:"2026/09/16 – 2026/09/18 — 免费"
+  });
+  assert.equal(describeDelivery({saleMessage:"2026/09/20 — 免费"},checkedAt).tone,"standard");
+  assert.equal(describeDelivery({saleMessage:"明天 — 免费"},checkedAt).tone,"fast");
+  assert.deepEqual(describeDelivery({saleMessage:"2-3 周 — 免费"},checkedAt),{
+    label:"2-3 周",timing:"未选地址或其他原因，Apple 未给出准确日期",tone:"unknown",detail:"2-3 周 — 免费"
+  });
+  assert.equal(describePickupDate("星期六 2026/09/19；Apple 香港广场"),"9/19");
+});
+
+test("送货文案缺失、暂无供应与未知地区格式不会互相误判", () => {
+  assert.equal(describeDelivery({saleMessage:null}),null);
+  assert.equal(describeDelivery({saleMessage:"暂无供应 — 免费"}).tone,"unavailable");
+  assert.deepEqual(describeDelivery({saleMessage:"Arrives 14 Oct — Free"},0),{
+    label:"Arrives 14 Oct",timing:"未选地址或其他原因，Apple 未给出准确日期",tone:"unknown",detail:"Arrives 14 Oct — Free"
+  });
+});
+
+test("Watch 日志明确标出送货查询使用的目录默认表带", () => {
+  const watch = {
+    ...target,
+    productName: "Apple Watch Ultra 4 49 毫米 黑色",
+    companionPart: "MKDY4FE/A",
+  };
+  const text = describeCycleRow(1, { target: watch, availability: { kind: "in_stock" } });
+  assert.match(text, /送货搭配表带=MKDY4FE\/A/);
 });

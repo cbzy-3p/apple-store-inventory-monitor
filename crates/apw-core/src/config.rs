@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{REGIONS, Target, region_by_locale};
+use crate::model::{DeliveryRegion, REGIONS, Target, region_by_locale};
 
 /// 检测到有货时自动打开的 Apple 页面。
 ///
@@ -177,6 +177,8 @@ pub struct Settings {
     pub locale: String,
     /// 监控目标列表。
     pub targets: Vec<Target>,
+    /// 统一的送货目的地区。为空时保留 Apple 按门店地区给出的估算。
+    pub delivery_region: Option<DeliveryRegion>,
     /// 每轮查询之间的间隔秒数。
     pub interval_seconds: u64,
     /// 为空表示不启用 Bark 推送。
@@ -202,6 +204,7 @@ impl Default for Settings {
         Self {
             locale: fallback_locale().to_string(),
             targets: Vec::new(),
+            delivery_region: None,
             interval_seconds: DEFAULT_INTERVAL_SECONDS,
             bark_url: String::new(),
             product_bark_urls: BTreeMap::new(),
@@ -221,6 +224,11 @@ impl Settings {
         if region_by_locale(&self.locale).is_none() {
             self.locale = fallback_locale().to_string();
         }
+
+        self.delivery_region = self
+            .delivery_region
+            .as_ref()
+            .and_then(DeliveryRegion::normalized);
 
         // 注意是「小于下限就回到默认值」，不是「夹到下限」。手抖填了 1 秒的人
         // 想要的是快，但 5 秒同样会被风控盯上；退回 30 秒才是安全的那一侧。
@@ -615,6 +623,9 @@ impl LegacyTarget {
             store_title: self.store_title,
             part_number: self.part_number,
             product_name: self.product_name,
+            companion_part: None,
+            companion_name: None,
+            kit_part: None,
         }
     }
 }
@@ -631,6 +642,7 @@ impl LegacySettings {
                 .into_iter()
                 .map(LegacyTarget::into_target)
                 .collect(),
+            delivery_region: None,
             interval_seconds: self
                 .interval_seconds
                 .and_then(|v| u64::try_from(v).ok())
@@ -660,6 +672,9 @@ mod tests {
             store_title: "上海-环球港".into(),
             part_number: part.into(),
             product_name: "iPhone 17 512GB 黑色".into(),
+            companion_part: None,
+            companion_name: None,
+            kit_part: None,
         }
     }
 

@@ -76,6 +76,9 @@ fn 目标(store: &str, part: &str) -> Target {
         store_title: "上海-环球港".into(),
         part_number: part.into(),
         product_name: "iPhone 17 512GB 黑色".into(),
+        companion_part: None,
+        companion_name: None,
+        kit_part: None,
     }
 }
 
@@ -83,6 +86,7 @@ fn 样例设置() -> Settings {
     Settings {
         locale: "zh_CN".into(),
         targets: vec![目标("R683", "MG724CH/A"), 目标("R448", "MG0A4CH/A")],
+        delivery_region: None,
         interval_seconds: 45,
         bark_url: "https://api.day.app/xxxx".into(),
         product_bark_urls: [("MG724CH/A".into(), "https://api.day.app/friend".into())]
@@ -494,6 +498,7 @@ fn 设置的线上格式是小驼峰() {
     for key in [
         "locale",
         "targets",
+        "deliveryRegion",
         "intervalSeconds",
         "barkUrl",
         "productBarkUrls",
@@ -505,7 +510,7 @@ fn 设置的线上格式是小驼峰() {
     assert!(!obj.contains_key("interval_seconds"), "不该有蛇形字段");
     assert_eq!(obj.get("openOnHit"), Some(&serde_json::json!("product")));
     assert!(!obj.contains_key("openBagOnHit"));
-    assert_eq!(obj.len(), 7);
+    assert_eq!(obj.len(), 8);
 }
 
 #[test]

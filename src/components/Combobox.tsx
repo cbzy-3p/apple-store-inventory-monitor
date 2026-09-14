@@ -16,6 +16,8 @@ import { cn } from "@/lib/utils";
 export interface ComboboxOption {
   value: string;
   label: string;
+  /** 复杂商品的补充说明，例如 Watch 自动搭配的表带。 */
+  description?: string;
 }
 
 /**

@@ -1,5 +1,17 @@
 import { describeAvailability, type TargetState, type StatusTone } from "./types.ts";
 
+export type DeliveryTone = "fast" | "soon" | "standard" | "later" | "unavailable" | "unknown";
+
+export interface DeliveryPresentation {
+  /** 表格里的紧凑日期，例如“10/14”或“9/22 – 9/25”。 */
+  label: string;
+  /** 不依赖颜色的速度提示，例如“明天”或“30 天后”。 */
+  timing: string;
+  tone: DeliveryTone;
+  /** 清理 HTML 后的 Apple 原始文案，供悬浮说明与辅助技术读取。 */
+  detail: string;
+}
+
 /** 只解释本轮业务字段；库存判定与到货通知仍以引擎结果为准。 */
 export function describeMonitorStatus(row: Pick<TargetState, "availability" | "pickupDetails">): {
   label: string; tone: StatusTone; detail: string | null;
@@ -41,10 +53,111 @@ function short(raw: string): string {
   return text.length > 160 ? `${text.slice(0, 160)}…` : text;
 }
 
+/**
+ * 把 Apple 的送货文案整理成一眼可扫读的日期与速度等级。
+ *
+ * 这里只负责展示，不参与取货库存判断。无法识别的地区化文案仍会原样展示，
+ * 避免因为新增地区或 Apple 改文案就把“可送货”错误折叠成“暂无送货”。
+ */
+export function describeDelivery(
+  pickupDetails?: Pick<NonNullable<TargetState["pickupDetails"]>, "saleMessage">,
+  checkedAtMs: number | null = Date.now(),
+): DeliveryPresentation | null {
+  const detail = short(pickupDetails?.saleMessage ?? "");
+  if (!detail) return null;
+
+  if (/暂无|不提供|不可送|未发售|尚未发售|not (?:currently )?available|unavailable|not offered|no delivery|提供(?:されて)?いません/i.test(detail)) {
+    return { label: "暂无送货", timing: "Apple 未提供日期", tone: "unavailable", detail };
+  }
+
+  const referenceMs = checkedAtMs ?? Date.now();
+  const dates = parseDeliveryDates(detail);
+  if (dates.length > 0) {
+    const firstDays = daysFrom(referenceMs, dates[0]!);
+    return {
+      label: dates.map(formatShortDate).join(dates.length > 1 ? " – " : ""),
+      timing: deliveryTiming(firstDays),
+      tone: deliveryTone(firstDays),
+      detail,
+    };
+  }
+
+  if (/今天|今日|today|当日|same[ -]?day|\d+\s*(?:小时|小時|hours?)/i.test(detail)) {
+    return { label: compactDeliveryLabel(detail), timing: "当日送达", tone: "fast", detail };
+  }
+  if (/明天|明日|tomorrow/i.test(detail)) {
+    return { label: compactDeliveryLabel(detail), timing: "1 天内", tone: "fast", detail };
+  }
+
+  return {
+    label: compactDeliveryLabel(detail),
+    timing: "未选地址或其他原因，Apple 未给出准确日期",
+    tone: "unknown",
+    detail,
+  };
+}
+
+/** 提取 Apple 明确返回的到店取货日期；不把它误当成送货日期。 */
+export function describePickupDate(pickupQuote?: string | null): string | null {
+  const dates = parseDeliveryDates(short(pickupQuote ?? ""));
+  return dates[0] ? formatShortDate(dates[0]) : null;
+}
+
+function parseDeliveryDates(raw: string): Date[] {
+  const values: Date[] = [];
+  const seen = new Set<number>();
+  const pattern = /\b(20\d{2})[/.\-](\d{1,2})[/.\-](\d{1,2})\b/g;
+  for (const match of raw.matchAll(pattern)) {
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const date = new Date(year, month - 1, day, 12);
+    if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) continue;
+    const time = date.getTime();
+    if (!seen.has(time)) {
+      seen.add(time);
+      values.push(date);
+    }
+  }
+  return values;
+}
+
+function daysFrom(referenceMs: number, deliveryDate: Date): number {
+  const reference = new Date(referenceMs);
+  const referenceDay = new Date(reference.getFullYear(), reference.getMonth(), reference.getDate(), 12);
+  return Math.round((deliveryDate.getTime() - referenceDay.getTime()) / 86_400_000);
+}
+
+function deliveryTiming(days: number): string {
+  if (days <= 0) return "今天";
+  if (days === 1) return "明天";
+  return `${days} 天后`;
+}
+
+function deliveryTone(days: number): DeliveryTone {
+  if (days <= 1) return "fast";
+  if (days <= 3) return "soon";
+  if (days <= 7) return "standard";
+  return "later";
+}
+
+function formatShortDate(date: Date): string {
+  return `${date.getMonth() + 1}/${date.getDate()}`;
+}
+
+function compactDeliveryLabel(raw: string): string {
+  const withoutPrice = raw.split(/\s+[—–-]\s+/u)[0]?.trim() || raw;
+  const compact = withoutPrice.replace(/\b20\d{2}[/.\-](\d{1,2})[/.\-](\d{1,2})\b/g, "$1/$2");
+  return compact.length > 28 ? `${compact.slice(0, 28)}…` : compact;
+}
+
 export function describeCycleRow(cycle: number, row: TargetState): string {
   const { label, detail } = describeMonitorStatus(row);
   const t = row.target;
-  return `第 ${cycle} 轮 · ${label}：${t.storeTitle} [${t.storeNumber}] ${t.productName} [${t.partNumber}]${detail ? `（${detail}）` : ""}`;
+  const watchBand = t.companionPart
+    ? `；送货搭配表带=${t.companionName ? `${t.companionName} [${t.companionPart}]` : t.companionPart}`
+    : "";
+  return `第 ${cycle} 轮 · ${label}：${t.storeTitle} [${t.storeNumber}] ${t.productName} [${t.partNumber}]${watchBand}${detail ? `（${detail}）` : ""}`;
 }
 
 export function describeCycleSummary(rows: TargetState[]): string {

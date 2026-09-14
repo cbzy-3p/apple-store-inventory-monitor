@@ -32,7 +32,7 @@ use tokio::task::JoinSet;
 
 use crate::apple::{ApiError, Fetcher};
 use crate::model::{
-    Availability, PickupDetails, Target, TargetKey, UnknownReason, region_by_locale,
+    Availability, DeliveryRegion, PickupDetails, Target, TargetKey, UnknownReason, region_by_locale,
 };
 
 /// 单个监控目标的当前状态。
@@ -133,6 +133,7 @@ pub struct WatcherConfig {
     pub concurrency: usize,
     /// 事件通道容量。
     pub event_buffer: usize,
+    pub delivery_region: Option<DeliveryRegion>,
 }
 
 impl Default for WatcherConfig {
@@ -142,6 +143,7 @@ impl Default for WatcherConfig {
             jitter: 0.2,
             concurrency: 4,
             event_buffer: 256,
+            delivery_region: None,
         }
     }
 }
@@ -149,6 +151,7 @@ impl Default for WatcherConfig {
 enum Command {
     SetTargets(Vec<Target>),
     SetInterval(Duration),
+    SetDeliveryRegion(Option<DeliveryRegion>),
     Start(oneshot::Sender<()>),
     Stop(oneshot::Sender<()>),
     Snapshot(oneshot::Sender<Vec<TargetState>>),
@@ -202,6 +205,10 @@ impl Watcher {
     /// 调整查询间隔，下一轮等待时生效。
     pub async fn set_interval(&self, interval: Duration) {
         let _ = self.cmd.send(Command::SetInterval(interval)).await;
+    }
+
+    pub async fn set_delivery_region(&self, region: Option<DeliveryRegion>) {
+        let _ = self.cmd.send(Command::SetDeliveryRegion(region)).await;
     }
 
     /// 启动监控。返回时引擎已经进入运行态。
@@ -277,7 +284,7 @@ struct TroubleReport {
 struct StoreGroup {
     locale: String,
     store_number: String,
-    parts: Vec<String>,
+    targets: Vec<Target>,
 }
 
 /// 单个门店查询完的结果。
@@ -303,11 +310,8 @@ struct StoreOutcome {
 fn expected_keys(groups: &[StoreGroup]) -> BTreeSet<TargetKey> {
     let mut keys = BTreeSet::new();
     for g in groups {
-        for part in &g.parts {
-            keys.insert(TargetKey(format!(
-                "{}|{}|{}",
-                g.locale, g.store_number, part
-            )));
+        for target in &g.targets {
+            keys.insert(target.key());
         }
     }
     keys
@@ -322,6 +326,7 @@ async fn run_queries<F: Fetcher>(
     client: F,
     groups: Vec<StoreGroup>,
     concurrency: usize,
+    delivery_region: Option<DeliveryRegion>,
 ) -> Vec<StoreOutcome> {
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut set = JoinSet::new();
@@ -329,11 +334,12 @@ async fn run_queries<F: Fetcher>(
     for group in groups {
         let client = client.clone();
         let sem = Arc::clone(&sem);
+        let delivery_region = delivery_region.clone();
         set.spawn(async move {
             // 拿不到许可只可能是信号量被关闭，这里不会发生；真发生了也只是
             // 少查一个门店，不该让整轮崩掉。
             let _permit = sem.acquire_owned().await;
-            query_one_store(&client, group).await
+            query_one_store(&client, group, delivery_region.as_ref()).await
         });
     }
 
@@ -365,7 +371,11 @@ async fn run_queries<F: Fetcher>(
     outcomes
 }
 
-async fn query_one_store<F: Fetcher>(client: &F, group: StoreGroup) -> StoreOutcome {
+async fn query_one_store<F: Fetcher>(
+    client: &F,
+    group: StoreGroup,
+    delivery_region: Option<&DeliveryRegion>,
+) -> StoreOutcome {
     let Some(region) = region_by_locale(&group.locale) else {
         // 地区认不出来就压根发不出请求。必须登记成故障，不能静默跳过 ——
         // 静默跳过会让这些行永远停在「待查询」，用户看不出程序从没查过它们。
@@ -373,12 +383,18 @@ async fn query_one_store<F: Fetcher>(client: &F, group: StoreGroup) -> StoreOutc
             field: "locale".into(),
             raw: group.locale.clone(),
         };
-        let n = group.parts.len();
+        let n = group.targets.len();
         return StoreOutcome {
             parts: group
-                .parts
+                .targets
                 .into_iter()
-                .map(|p| (p, Availability::Unknown(reason.clone()), None))
+                .map(|target| {
+                    (
+                        target.part_number,
+                        Availability::Unknown(reason.clone()),
+                        None,
+                    )
+                })
                 .collect(),
             trouble: Some(TroubleReport {
                 // 这句本身就说清了该做什么，不必再挂一条泛泛的建议。
@@ -396,7 +412,7 @@ async fn query_one_store<F: Fetcher>(client: &F, group: StoreGroup) -> StoreOutc
     };
 
     match client
-        .pickup_message(region, &group.store_number, &group.parts)
+        .pickup_message(region, &group.store_number, &group.targets, delivery_region)
         .await
     {
         Err(err) => {
@@ -419,12 +435,18 @@ async fn query_one_store<F: Fetcher>(client: &F, group: StoreGroup) -> StoreOutc
             });
 
             let reason = err.into_unknown_reason();
-            let n = group.parts.len();
+            let n = group.targets.len();
             StoreOutcome {
                 parts: group
-                    .parts
+                    .targets
                     .into_iter()
-                    .map(|p| (p, Availability::Unknown(reason.clone()), None))
+                    .map(|target| {
+                        (
+                            target.part_number,
+                            Availability::Unknown(reason.clone()),
+                            None,
+                        )
+                    })
                     .collect(),
                 locale: group.locale,
                 store_number: group.store_number,
@@ -434,13 +456,14 @@ async fn query_one_store<F: Fetcher>(client: &F, group: StoreGroup) -> StoreOutc
             }
         }
         Ok(result) => {
-            let mut parts = Vec::with_capacity(group.parts.len());
+            let mut parts = Vec::with_capacity(group.targets.len());
             let mut problems = 0usize;
             // 真正拿到明确答复（有货或无货）的型号数。
             let mut resolved = 0usize;
             let mut omitted = 0usize;
 
-            for part in &group.parts {
+            for target in &group.targets {
+                let part = &target.part_number;
                 match result.parts.get(part) {
                     None => {
                         // 请求成功但响应里没有这个型号，通常意味着零件号已经下架
@@ -473,10 +496,10 @@ async fn query_one_store<F: Fetcher>(client: &F, group: StoreGroup) -> StoreOutc
             // 一个型号都没拿到明确答复，说明这个门店这一轮实质上是废的：
             // 要么零件号全对不上，要么 Apple 换了词表。必须按门店级失败处理，
             // 否则不退避、不告警，程序会继续按原频率请求一个已经失效的结构。
-            let dead = resolved == 0 && !group.parts.is_empty();
+            let dead = resolved == 0 && !group.targets.is_empty();
             StoreOutcome {
                 trouble: dead.then(|| TroubleReport {
-                    reason: if omitted == group.parts.len() {
+                    reason: if omitted == group.targets.len() {
                         format!(
                             "Apple 的门店 {} 响应未包含本次请求的任何型号；暂无库存结论",
                             group.store_number
@@ -487,7 +510,7 @@ async fn query_one_store<F: Fetcher>(client: &F, group: StoreGroup) -> StoreOutc
                             group.store_number
                         )
                     },
-                    advice: Some(if omitted == group.parts.len() {
+                    advice: Some(if omitted == group.targets.len() {
                         TroubleAdvice::CheckProduct
                     } else {
                         TroubleAdvice::WaitForUpdate
@@ -566,7 +589,12 @@ impl<F: Fetcher> Engine<F> {
                 store_count: groups.len(),
                 target_count: expected.len(),
             });
-            let queries = run_queries(self.client.clone(), groups, self.config.concurrency);
+            let queries = run_queries(
+                self.client.clone(),
+                groups,
+                self.config.concurrency,
+                self.config.delivery_region.clone(),
+            );
             tokio::pin!(queries);
 
             let outcomes = loop {
@@ -641,6 +669,7 @@ impl<F: Fetcher> Engine<F> {
                     self.config.interval = d;
                 }
             }
+            Command::SetDeliveryRegion(region) => self.config.delivery_region = region,
             Command::Start(reply) => {
                 self.set_running(true).await;
                 let _ = reply.send(());
@@ -699,24 +728,24 @@ impl<F: Fetcher> Engine<F> {
     /// 把目标按 (地区, 门店) 聚合，使每个门店每轮只发一次请求。
     fn group_targets(&self) -> Vec<StoreGroup> {
         let mut order: Vec<(String, String)> = Vec::new();
-        let mut index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        let mut index: BTreeMap<(String, String), Vec<Target>> = BTreeMap::new();
 
         for t in &self.targets {
             let k = (t.locale.clone(), t.store_number.clone());
             if !index.contains_key(&k) {
                 order.push(k.clone());
             }
-            index.entry(k).or_default().push(t.part_number.clone());
+            index.entry(k).or_default().push(t.clone());
         }
 
         order
             .into_iter()
             .map(|(locale, store_number)| {
-                let parts = index.remove(&(locale.clone(), store_number.clone()));
+                let targets = index.remove(&(locale.clone(), store_number.clone()));
                 StoreGroup {
                     locale,
                     store_number,
-                    parts: parts.unwrap_or_default(),
+                    targets: targets.unwrap_or_default(),
                 }
             })
             .collect()

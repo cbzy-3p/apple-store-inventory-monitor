@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use crate::model::{Availability, PickupDetails, Region, UnknownReason};
+use crate::model::{Availability, DeliveryRegion, PickupDetails, Region, Target, UnknownReason};
 
 /// 请求失败的分类。
 ///
@@ -459,7 +459,8 @@ pub trait Fetcher: Clone + Send + Sync + 'static {
         &self,
         region: &'static Region,
         store_number: &str,
-        parts: &[String],
+        targets: &[Target],
+        delivery_region: Option<&DeliveryRegion>,
     ) -> impl std::future::Future<Output = Result<StoreAvailability, ApiError>> + Send;
 }
 
@@ -468,9 +469,14 @@ impl Fetcher for AppleClient {
         &self,
         region: &'static Region,
         store_number: &str,
-        parts: &[String],
+        targets: &[Target],
+        _delivery_region: Option<&DeliveryRegion>,
     ) -> Result<StoreAvailability, ApiError> {
-        AppleClient::pickup_message(self, region, store_number, parts).await
+        let parts: Vec<String> = targets
+            .iter()
+            .map(|target| target.part_number.clone())
+            .collect();
+        AppleClient::pickup_message(self, region, store_number, &parts).await
     }
 }
 

@@ -141,6 +141,29 @@ pub struct PickupDetails {
     pub sale_message: Option<String>,
 }
 
+/// Apple 送货查询使用的行政区。中国大陆接口只需要省、市、区，
+/// 不需要姓名、电话或街道地址。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryRegion {
+    pub state: String,
+    pub city: String,
+    pub district: String,
+}
+
+impl DeliveryRegion {
+    pub fn normalized(&self) -> Option<Self> {
+        let state = self.state.trim();
+        let city = self.city.trim();
+        let district = self.district.trim();
+        (!state.is_empty() && !city.is_empty() && !district.is_empty()).then(|| Self {
+            state: state.to_string(),
+            city: city.to_string(),
+            district: district.to_string(),
+        })
+    }
+}
+
 /// 一个可监控的商品品类。
 ///
 /// 品类不只是界面上的一个筛选器：它决定购买页挂在哪条路径下
@@ -418,6 +441,15 @@ pub struct Product {
     pub color: String,
     /// 界面展示名，如「iPhone 17 512GB 黑色」。
     pub title: String,
+    /// Apple Watch 表壳查询时随同发送的一条默认表带；其他品类为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_part: Option<String>,
+    /// Apple Watch 送货查询的整表套件零件号（例如 `Z0YQ`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kit_part: Option<String>,
+    /// Apple Watch 表壳尺寸的接口值（例如 `42mm`），用于读取兼容表带尺码。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_case_size: Option<String>,
 }
 
 /// 一家 Apple 直营店。
@@ -441,6 +473,13 @@ pub struct Target {
     pub store_title: String,
     pub part_number: String,
     pub product_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_part: Option<String>,
+    /// 用户选中的表带说明，例如「单圈表带 · 勃艮第酒红色 · 6 号」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kit_part: Option<String>,
 }
 
 impl Target {
@@ -571,6 +610,9 @@ mod tests {
             store_title: "上海-环球港".into(),
             part_number: part.into(),
             product_name: "x".into(),
+            companion_part: None,
+            companion_name: None,
+            kit_part: None,
         };
         assert_ne!(mk("MG724CH/A").key(), mk("MG0A4CH/A").key());
         assert_eq!(mk("MG724CH/A").key(), mk("MG724CH/A").key());

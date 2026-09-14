@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import packageInfo from "../package.json";
 import {
   Activity,
   AlertTriangle,
@@ -18,6 +19,7 @@ import {
   Smartphone,
   SquareTerminal,
   Trash2,
+  Truck,
   Volume2,
   X,
 } from "lucide-react";
@@ -67,6 +69,9 @@ import {
   connect,
   dismissUpdate,
   installUpdate,
+  loadDeliveryLocalities,
+  loadWatchBandChoices,
+  loadWatchBandSizes,
   openAuthorPage,
   openProjectPage,
   openReleasePage,
@@ -84,6 +89,8 @@ import {
 } from "@/lib/store";
 import {
   type Availability,
+  type DeliveryLocalities,
+  type DeliveryRegion,
   type PickupDetails,
   type Category,
   type OpenOnHit,
@@ -92,11 +99,33 @@ import {
   isUntrusted,
   type StatusTone,
   type Target,
+  type WatchBandChoice,
+  type WatchBandSize,
   targetKey,
 } from "@/lib/types";
 
-import { describeMonitorStatus } from "@/lib/monitorLog";
+import { describeDelivery, describeMonitorStatus, describePickupDate, type DeliveryTone } from "@/lib/monitorLog";
 import { compareNewestProducts, sortMonitorsNewestFirst } from "@/lib/productOrder";
+
+const EMPTY_DELIVERY_LOCALITIES: DeliveryLocalities = {
+  states: [],
+  cities: [],
+  districts: [],
+};
+
+function compactProductName(name: string): string {
+  if (!name.startsWith("Apple Watch ")) return name;
+  return name
+    .replace(/^Apple Watch\s+/, "")
+    .replace(/\s+新外观(?=\s|$)/g, "")
+    .replace(/(\d+)\s*毫米/g, "$1mm")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function watchBandDescription(companionPart?: string): string | undefined {
+  return companionPart ? `送货查询使用目录默认表带 ${companionPart}` : undefined;
+}
 
 function GithubBrandIcon() {
   return (
@@ -138,14 +167,18 @@ const TONE_DOT: Record<StatusTone, string> = {
 
 function StatusBadge({ availability, pickupDetails }: { availability: Availability; pickupDetails?: PickupDetails }) {
   const { label, tone, detail } = describeMonitorStatus({ availability, pickupDetails });
+  const pickupDate = availability.kind === "in_stock" ? describePickupDate(pickupDetails?.pickupQuote) : null;
   const badge = (
-    <Badge
-      variant="outline"
-      className={`h-7 min-w-20 justify-center gap-2 px-2.5 font-medium ${TONE_CLASS[tone]}`}
-    >
-      <span className={`size-1.5 rounded-full ${TONE_DOT[tone]}`} aria-hidden="true" />
-      {label}
-    </Badge>
+    <span className="inline-flex flex-col items-center gap-0.5">
+      <Badge
+        variant="outline"
+        className={`h-7 min-w-20 justify-center gap-2 px-2.5 font-medium ${TONE_CLASS[tone]}`}
+      >
+        <span className={`size-1.5 rounded-full ${TONE_DOT[tone]}`} aria-hidden="true" />
+        {label}
+      </Badge>
+      {pickupDate ? <span className="text-[10px] leading-3 text-in-stock tabular-nums">{pickupDate} 可取</span> : null}
+    </span>
   );
   if (!detail) return badge;
   return (
@@ -154,6 +187,38 @@ function StatusBadge({ availability, pickupDetails }: { availability: Availabili
         <span className="cursor-help">{badge}</span>
       </TooltipTrigger>
       <TooltipContent className="max-w-90">{detail}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+const DELIVERY_CLASS: Record<DeliveryTone, string> = {
+  fast: "border-delivery-fast/30 bg-delivery-fast/12 text-delivery-fast",
+  soon: "border-delivery-soon/30 bg-delivery-soon/12 text-delivery-soon",
+  standard: "border-delivery-standard/30 bg-delivery-standard/12 text-delivery-standard",
+  later: "border-delivery-later/35 bg-delivery-later/12 text-delivery-later",
+  unavailable: "border-border bg-muted/35 text-muted-foreground",
+  unknown: "border-delivery-unknown/30 bg-delivery-unknown/10 text-delivery-unknown",
+};
+
+function DeliveryBadge({ pickupDetails, lastCheckedMs }: { pickupDetails?: PickupDetails; lastCheckedMs: number | null }) {
+  const delivery = describeDelivery(pickupDetails, lastCheckedMs);
+  if (!delivery) {
+    return <span className="text-xs text-muted-foreground/60" title="Apple 本轮未返回预计送货时间">未返回</span>;
+  }
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          className={`inline-grid min-w-24 max-w-48 cursor-help grid-cols-[auto_minmax(0,1fr)] items-center gap-x-1.5 rounded-lg border px-2 py-1.5 ${DELIVERY_CLASS[delivery.tone]}`}
+          aria-label={`预计送货：${delivery.detail}；${delivery.timing}`}
+        >
+          <span className="size-1.5 rounded-full bg-current" aria-hidden="true" />
+          <span className="whitespace-nowrap text-xs font-semibold tabular-nums">{delivery.label}</span>
+          <span className="col-start-2 whitespace-normal text-[10px] leading-3 opacity-80">{delivery.timing}</span>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-90">Apple 预计送货：{delivery.detail}</TooltipContent>
     </Tooltip>
   );
 }
@@ -238,6 +303,172 @@ function ProductBarkRoute({
   );
 }
 
+function watchBandSizeLabel(text: string): string {
+  return /^\d+$/.test(text.trim()) ? `${text.trim()} 号` : text.trim();
+}
+
+function WatchBandPicker({
+  target,
+  targets,
+  defaultCompanionPart,
+  disabled,
+}: {
+  target: Target;
+  targets: Target[];
+  defaultCompanionPart?: string;
+  disabled: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [choices, setChoices] = useState<WatchBandChoice[]>([]);
+  const [sizes, setSizes] = useState<WatchBandSize[]>([]);
+  const [choiceValue, setChoiceValue] = useState("");
+  const [selectedPart, setSelectedPart] = useState("");
+  const [loadingChoices, setLoadingChoices] = useState(false);
+  const [loadingSizes, setLoadingSizes] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const currentLabel = target.companionName
+    ? target.companionName
+    : `目录默认表带 ${target.companionPart ?? "未设置"}`;
+
+  async function openPicker(nextOpen: boolean) {
+    setOpen(nextOpen);
+    if (!nextOpen || choices.length > 0 || loadingChoices) return;
+    setLoadingChoices(true);
+    setError(null);
+    try {
+      setChoices(await loadWatchBandChoices(target.locale, target.partNumber));
+    } catch (reason) {
+      setError(`读取 Apple 表带选项失败：${String(reason)}`);
+    } finally {
+      setLoadingChoices(false);
+    }
+  }
+
+  async function chooseBand(value: string) {
+    setChoiceValue(value);
+    setSelectedPart("");
+    setSizes([]);
+    const choice = choices.find((item) => `${item.styleKey}::${item.colorKey}` === value);
+    if (!choice) return;
+    setLoadingSizes(true);
+    setError(null);
+    try {
+      const nextSizes = await loadWatchBandSizes(
+        target.locale,
+        target.partNumber,
+        choice.styleKey,
+        choice.colorKey,
+      );
+      setSizes(nextSizes);
+      const onlySize = nextSizes.length === 1 ? nextSizes.at(0) : undefined;
+      if (onlySize) setSelectedPart(onlySize.partNumber);
+    } catch (reason) {
+      setError(`读取 Apple 表带尺码失败：${String(reason)}`);
+    } finally {
+      setLoadingSizes(false);
+    }
+  }
+
+  async function applyBand() {
+    const choice = choices.find((item) => `${item.styleKey}::${item.colorKey}` === choiceValue);
+    const size = sizes.find((item) => item.partNumber === selectedPart);
+    if (!choice || !size) return;
+    setSaving(true);
+    const companionName = `${choice.styleName} · ${choice.colorName} · ${watchBandSizeLabel(size.text)}`;
+    const saved = await setTargets(targets.map((item) => (
+      item.locale === target.locale && item.partNumber === target.partNumber
+        ? { ...item, companionPart: size.partNumber, companionName }
+        : item
+    )));
+    setSaving(false);
+    if (saved) setOpen(false);
+  }
+
+  async function restoreAutomaticBand() {
+    if (!defaultCompanionPart) return;
+    setSaving(true);
+    const saved = await setTargets(targets.map((item) => (
+      item.locale === target.locale && item.partNumber === target.partNumber
+        ? { ...item, companionPart: defaultCompanionPart, companionName: undefined }
+        : item
+    )));
+    setSaving(false);
+    if (saved) setOpen(false);
+  }
+
+  return (
+    <Popover open={open} onOpenChange={(nextOpen) => void openPicker(nextOpen)}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className="mt-0.5 block max-w-full truncate text-left text-[11px] leading-4 text-muted-foreground/75 hover:text-primary hover:underline"
+          title={`${currentLabel}；点击按官网款式、颜色和尺码修改`}
+          disabled={disabled}
+        >
+          送货表带：{currentLabel}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-[28rem] max-w-[calc(100vw-2rem)] space-y-4 rounded-xl">
+        <PopoverHeader>
+          <PopoverTitle>选择精确送货表带</PopoverTitle>
+          <PopoverDescription className="leading-5">
+            同一表壳在所有门店共用这条表带。送货日期取决于表壳、表带和尺码的完整组合。
+          </PopoverDescription>
+        </PopoverHeader>
+        <div className="grid gap-3">
+          <div className="field-group">
+            <Label className="control-label">款式与颜色</Label>
+            <Select value={choiceValue} onValueChange={(value) => void chooseBand(value)} disabled={loadingChoices || saving}>
+              <SelectTrigger className="control-surface w-full">
+                <SelectValue placeholder={loadingChoices ? "正在读取 Apple 选项…" : "选择表带款式和颜色"} />
+              </SelectTrigger>
+              <SelectContent>
+                {choices.map((choice) => (
+                  <SelectItem
+                    key={`${choice.styleKey}::${choice.colorKey}`}
+                    value={`${choice.styleKey}::${choice.colorKey}`}
+                  >
+                    {choice.styleName} · {choice.colorName}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="field-group">
+            <Label className="control-label">尺码</Label>
+            <Select value={selectedPart} onValueChange={setSelectedPart} disabled={!choiceValue || loadingSizes || saving}>
+              <SelectTrigger className="control-surface w-full">
+                <SelectValue placeholder={loadingSizes ? "正在读取 Apple 尺码…" : "选择尺码"} />
+              </SelectTrigger>
+              <SelectContent>
+                {sizes.map((size) => (
+                  <SelectItem key={size.partNumber} value={size.partNumber}>
+                    {watchBandSizeLabel(size.text)} · {size.partNumber}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          {error ? <p role="alert" className="text-xs leading-5 text-destructive">{error}</p> : null}
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <Button variant="ghost" size="sm" onClick={() => void restoreAutomaticBand()} disabled={!defaultCompanionPart || saving}>
+            恢复自动搭配
+          </Button>
+          <div className="flex gap-2">
+            <Button variant="ghost" size="sm" onClick={() => setOpen(false)} disabled={saving}>取消</Button>
+            <Button size="sm" onClick={() => void applyBand()} disabled={!selectedPart || saving}>
+              {saving ? "保存中…" : "应用到同型号"}
+            </Button>
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 export default function App() {
   const ui = useSyncExternalStore(watcherStore.subscribe, watcherStore.getSnapshot);
   const [clockMs, setClockMs] = useState(() => Date.now());
@@ -258,9 +489,91 @@ export default function App() {
   const [isAdding, setIsAdding] = useState(false);
   const [barkDraft, setBarkDraft] = useState<string | null>(null);
   const [intervalDraft, setIntervalDraft] = useState<number | null>(null);
+  const [deliveryDraft, setDeliveryDraft] = useState<DeliveryRegion>({ state: "", city: "", district: "" });
+  const [deliveryOptions, setDeliveryOptions] = useState<DeliveryLocalities>(EMPTY_DELIVERY_LOCALITIES);
+  const [deliveryOptionsLoading, setDeliveryOptionsLoading] = useState(false);
+  const [deliveryDirty, setDeliveryDirty] = useState(false);
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
+  const [deliverySaving, setDeliverySaving] = useState(false);
+  const deliveryRequestId = useRef(0);
+
+  useEffect(() => {
+    if (!ui.ready || deliveryDirty) return;
+    setDeliveryDraft(ui.settings.deliveryRegion ?? { state: "", city: "", district: "" });
+  }, [ui.ready, ui.settings.deliveryRegion, deliveryDirty]);
+
+  useEffect(() => {
+    if (!ui.ready) return;
+    if (ui.settings.locale !== "zh_CN") {
+      setDeliveryOptions(EMPTY_DELIVERY_LOCALITIES);
+      setDeliveryOptionsLoading(false);
+      setDeliveryError("Apple 官网当前仅在中国大陆站提供省、市、区三级选择。");
+      return;
+    }
+
+    const selected = ui.settings.deliveryRegion;
+    const requestId = ++deliveryRequestId.current;
+    setDeliveryOptionsLoading(true);
+    void loadDeliveryLocalities(ui.settings.locale, selected?.state, selected?.city)
+      .then((options) => {
+        if (deliveryRequestId.current !== requestId) return;
+        setDeliveryOptions(options);
+        if (selected && (
+          !options.states.some((option) => option.value === selected.state)
+          || !options.cities.some((option) => option.value === selected.city)
+          || !options.districts.some((option) => option.value === selected.district)
+        )) {
+          setDeliveryDraft({ state: "", city: "", district: "" });
+          setDeliveryDirty(true);
+          setDeliveryError("此前保存的地址不是 Apple 官方选项，请重新选择。");
+        } else {
+          setDeliveryError(null);
+        }
+      })
+      .catch((error) => {
+        if (deliveryRequestId.current !== requestId) return;
+        setDeliveryOptions(EMPTY_DELIVERY_LOCALITIES);
+        setDeliveryError(`加载 Apple 地区选项失败：${String(error)}`);
+      })
+      .finally(() => {
+        if (deliveryRequestId.current === requestId) setDeliveryOptionsLoading(false);
+      });
+  }, [ui.ready, ui.settings.deliveryRegion, ui.settings.locale]);
+
+  async function refreshDeliveryOptions(stateName: string, cityName = "") {
+    const requestId = ++deliveryRequestId.current;
+    setDeliveryOptionsLoading(true);
+    setDeliveryError(null);
+    try {
+      const options = await loadDeliveryLocalities(ui.settings.locale, stateName, cityName);
+      if (deliveryRequestId.current === requestId) setDeliveryOptions(options);
+    } catch (error) {
+      if (deliveryRequestId.current === requestId) {
+        setDeliveryError(`加载 Apple 地区选项失败：${String(error)}`);
+      }
+    } finally {
+      if (deliveryRequestId.current === requestId) setDeliveryOptionsLoading(false);
+    }
+  }
+
+  async function persistDeliveryRegion(region: DeliveryRegion) {
+    setDeliverySaving(true);
+    setDeliveryError(null);
+    const saved = await saveSettings({ deliveryRegion: region });
+    if (saved) {
+      setDeliveryDirty(false);
+    } else {
+      setDeliveryError("送货地区保存失败，请重新选择区或稍后重试。");
+    }
+    setDeliverySaving(false);
+  }
 
   const barkValue = barkDraft ?? ui.settings.barkUrl;
   const intervalValue = intervalDraft ?? ui.settings.intervalSeconds;
+  const deliverySelectionValid =
+    deliveryOptions.states.some((option) => option.value === deliveryDraft.state)
+    && deliveryOptions.cities.some((option) => option.value === deliveryDraft.city)
+    && deliveryOptions.districts.some((option) => option.value === deliveryDraft.district);
   const latestCheckedMs = Math.max(0, ...ui.rows.map((row) => row.lastCheckedMs ?? 0));
   const secondsUntilNextCheck = latestCheckedMs
     ? Math.max(0, Math.ceil((latestCheckedMs + ui.settings.intervalSeconds * 1_000 - clockMs) / 1_000))
@@ -279,7 +592,13 @@ export default function App() {
       ui.products
         .filter((product) => product.category === ui.category)
         .sort(compareNewestProducts)
-        .map((product) => ({ value: product.partNumber, label: product.title })),
+        .map((product) => ({
+          value: product.partNumber,
+          label: compactProductName(product.title),
+          description: product.category === "watch"
+            ? watchBandDescription(product.companionPart)
+            : undefined,
+        })),
     [ui.products, ui.category],
   );
 
@@ -333,6 +652,8 @@ export default function App() {
           storeTitle: store.title,
           partNumber: product.partNumber,
           productName: product.title,
+          ...(product.companionPart ? { companionPart: product.companionPart } : {}),
+          ...(product.kitPart ? { kitPart: product.kitPart } : {}),
         };
         if (!existing.has(targetKey(target))) {
           existing.add(targetKey(target));
@@ -364,7 +685,7 @@ export default function App() {
   return (
     <TooltipProvider delayDuration={180}>
       <div className="app-canvas min-h-screen text-foreground">
-        <main className="mx-auto flex min-h-screen w-full max-w-[1180px] flex-col gap-4 px-5 py-5 lg:h-screen lg:overflow-hidden">
+        <main className="flex min-h-screen w-full max-w-none flex-col gap-4 px-5 py-5 lg:h-screen lg:overflow-hidden">
           <header className="surface-panel flex shrink-0 items-center justify-between gap-5 px-5 py-4">
             <div className="flex min-w-0 items-center gap-3.5">
               <div className="brand-mark" aria-hidden="true">
@@ -378,6 +699,9 @@ export default function App() {
                   <Badge variant="outline" className="hidden border-primary/20 bg-primary/8 text-primary sm:inline-flex">
                     LIVE
                   </Badge>
+                  <span className="hidden text-[11px] tabular-nums text-muted-foreground sm:inline">
+                    v{packageInfo.version}
+                  </span>
                 </div>
                 <p className="mt-0.5 truncate text-sm text-muted-foreground">
                   Apple 直营店取货库存监控
@@ -494,7 +818,7 @@ export default function App() {
             </Alert>
           )}
 
-          <div className="grid min-h-0 flex-1 gap-4 min-[980px]:grid-cols-[minmax(0,1.65fr)_20rem]">
+          <div className="grid min-h-0 flex-1 gap-4 min-[980px]:grid-cols-[minmax(0,1fr)_22rem]">
             <div className="flex min-h-0 flex-col gap-4">
               <section className="surface-panel shrink-0 p-4" aria-labelledby="create-monitor-title">
                 <div className="mb-4 flex items-start justify-between gap-4">
@@ -589,6 +913,11 @@ export default function App() {
                       selectionUnit="个型号"
                       disabled={isAdding || productOptions.length === 0}
                     />
+                    {ui.category === "watch" ? (
+                      <p className="text-[11px] leading-4 text-muted-foreground">
+                        Watch 会先使用目录默认表带查询；也可在监控列表中按官网款式、颜色和尺码选择精确表带。
+                      </p>
+                    ) : null}
                   </div>
                 </div>
 
@@ -640,7 +969,7 @@ export default function App() {
                     </div>
                     <div>
                       <h2 id="monitor-list-title" className="text-sm font-semibold">监控列表</h2>
-                      <p className="mt-0.5 text-xs text-muted-foreground">新款优先 · 库存变化实时更新</p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">新款优先 · 取货与送货状态实时更新</p>
                     </div>
                   </div>
                   <span className="rounded-full border border-border/60 bg-background/40 px-2.5 py-1 text-xs tabular-nums text-muted-foreground">
@@ -649,21 +978,24 @@ export default function App() {
                 </div>
 
                 <ScrollArea className="min-h-0 flex-1">
-                  <Table>
+                  <Table className="table-fixed">
                     <TableHeader className="sticky top-0 z-10 bg-card/95">
                       <TableRow className="hover:bg-transparent">
-                        <TableHead className="w-28 px-4 text-xs text-muted-foreground">状态</TableHead>
-                        <TableHead className="px-3 text-xs text-muted-foreground">门店</TableHead>
+                        <TableHead className="w-24 px-4 text-xs text-muted-foreground">取货状态</TableHead>
+                        <TableHead className="w-36 px-3 text-xs text-muted-foreground">门店</TableHead>
                         <TableHead className="px-3 text-xs text-muted-foreground">型号</TableHead>
-                        <TableHead className="w-24 px-3 text-xs text-muted-foreground">最后检查</TableHead>
-                        <TableHead className="w-24 px-2 text-xs text-muted-foreground">Bark</TableHead>
-                        <TableHead className="w-14" />
+                        <TableHead className="w-48 px-3 text-xs text-muted-foreground">
+                          <span className="flex items-center gap-1.5"><Truck className="size-3.5" aria-hidden="true" />预计送货</span>
+                        </TableHead>
+                        <TableHead className="w-20 px-2 text-xs text-muted-foreground">最后检查</TableHead>
+                        <TableHead className="w-20 px-1 text-xs text-muted-foreground">Bark</TableHead>
+                        <TableHead className="sticky right-0 z-20 w-12 border-l border-border/40 bg-card/95" aria-label="操作" />
                       </TableRow>
                     </TableHeader>
                     <TableBody>
                       {ui.rows.length === 0 ? (
                         <TableRow className="hover:bg-transparent">
-                          <TableCell colSpan={6} className="h-44 text-center">
+                          <TableCell colSpan={7} className="h-44 text-center">
                             <div className="mx-auto flex max-w-xs flex-col items-center">
                               <div className="mb-3 flex size-11 items-center justify-center rounded-2xl border border-border/60 bg-muted/35 text-muted-foreground">
                                 <Radar className="size-5" aria-hidden="true" />
@@ -679,19 +1011,30 @@ export default function App() {
                         </TableRow>
                       ) : (
                         sortedRows.map((row) => (
-                          <TableRow key={targetKey(row.target)} className="group h-14 hover:bg-muted/22">
+                          <TableRow key={targetKey(row.target)} className="group hover:bg-muted/22">
                             <TableCell className="px-4"><StatusBadge availability={row.availability} pickupDetails={row.pickupDetails} /></TableCell>
-                            <TableCell className="px-3 font-medium">{row.target.storeTitle}</TableCell>
-                            <TableCell className="max-w-[24rem] truncate px-3 text-muted-foreground" title={row.target.productName}>
+                            <TableCell className="truncate px-3 font-medium" title={row.target.storeTitle}>{row.target.storeTitle}</TableCell>
+                            <TableCell className="min-w-0 px-3 py-2.5 text-muted-foreground" title={row.target.productName}>
                               <button
-                                className="text-left hover:text-primary hover:underline"
+                                className="block max-w-full whitespace-normal text-left leading-5 hover:text-primary hover:underline"
                                 aria-label={`打开商品页：${row.target.productName}`}
                                 onClick={() => void openTargetProduct(row.target)}
                               >
-                                {row.target.productName}
+                                {compactProductName(row.target.productName)}
                               </button>
+                              {row.target.companionPart && row.target.kitPart ? (
+                                <WatchBandPicker
+                                  target={row.target}
+                                  targets={targets}
+                                  defaultCompanionPart={ui.products.find((product) => product.partNumber === row.target.partNumber)?.companionPart}
+                                  disabled={isAdding}
+                                />
+                              ) : null}
                             </TableCell>
-                            <TableCell className="px-3 font-mono text-xs tabular-nums text-muted-foreground">
+                            <TableCell className="overflow-hidden px-2">
+                              <DeliveryBadge pickupDetails={row.pickupDetails} lastCheckedMs={row.lastCheckedMs} />
+                            </TableCell>
+                            <TableCell className="px-2 font-mono text-xs tabular-nums text-muted-foreground">
                               {formatTime(row.lastCheckedMs)}
                             </TableCell>
                             <TableCell className="px-1">
@@ -701,11 +1044,11 @@ export default function App() {
                                 disabled={isAdding}
                               />
                             </TableCell>
-                            <TableCell className="pr-3">
+                            <TableCell className="sticky right-0 z-10 border-l border-border/40 bg-card/95 pr-2 group-hover:bg-muted">
                               <Button
                                 variant="ghost"
                                 size="icon-sm"
-                                className="text-muted-foreground opacity-60 hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
+                                className="text-muted-foreground opacity-80 hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
                                 aria-label="删除这条监控"
                                 disabled={isAdding}
                                 onClick={() => void onRemove(row.target)}
@@ -775,6 +1118,112 @@ export default function App() {
                     />
                     <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-muted-foreground">秒</span>
                   </div>
+                </div>
+
+                <div className="mt-3 field-group">
+                  <div className="flex items-center justify-between gap-3">
+                    <Label className="control-label">
+                      <MapPin className="size-3.5" aria-hidden="true" /> 送货地区
+                    </Label>
+                    <span className="text-[10px] text-muted-foreground" role="status" aria-live="polite">
+                      {deliverySaving
+                        ? "保存中…"
+                        : deliveryOptionsLoading
+                        ? "读取官网…"
+                        : deliveryDirty
+                          ? deliverySelectionValid ? "即将保存" : "继续选择"
+                          : ui.settings.deliveryRegion ? "已生效" : "未设置"}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <Select
+                      value={deliveryOptions.states.some((option) => option.value === deliveryDraft.state) ? deliveryDraft.state : ""}
+                      disabled={deliveryOptionsLoading || deliveryOptions.states.length === 0}
+                      onValueChange={(value) => {
+                        setDeliveryDirty(true);
+                        setDeliveryError(null);
+                        setDeliveryDraft({ state: value, city: "", district: "" });
+                        void refreshDeliveryOptions(value);
+                      }}
+                    >
+                      <SelectTrigger aria-label="省份" className="control-surface h-9 w-full min-w-0 px-2 text-xs">
+                        <SelectValue placeholder="省份" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {deliveryOptions.states.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>{option.text}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Select
+                      value={deliveryOptions.cities.some((option) => option.value === deliveryDraft.city) ? deliveryDraft.city : ""}
+                      disabled={deliveryOptionsLoading || !deliveryDraft.state || deliveryOptions.cities.length === 0}
+                      onValueChange={(value) => {
+                        setDeliveryDirty(true);
+                        setDeliveryError(null);
+                        setDeliveryDraft((previous) => ({ ...previous, city: value, district: "" }));
+                        void refreshDeliveryOptions(deliveryDraft.state, value);
+                      }}
+                    >
+                      <SelectTrigger aria-label="城市" className="control-surface h-9 w-full min-w-0 px-2 text-xs">
+                        <SelectValue placeholder="城市" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {deliveryOptions.cities.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>{option.text}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Select
+                      value={deliveryOptions.districts.some((option) => option.value === deliveryDraft.district) ? deliveryDraft.district : ""}
+                      disabled={deliveryOptionsLoading || !deliveryDraft.city || deliveryOptions.districts.length === 0}
+                      onValueChange={(value) => {
+                        const next = { ...deliveryDraft, district: value };
+                        setDeliveryDirty(true);
+                        setDeliveryError(null);
+                        setDeliveryDraft(next);
+                        void persistDeliveryRegion(next);
+                      }}
+                    >
+                      <SelectTrigger aria-label="区" className="control-surface h-9 w-full min-w-0 px-2 text-xs">
+                        <SelectValue placeholder="区" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {deliveryOptions.districts.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>{option.text}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="text-[11px] leading-4 text-muted-foreground">
+                      选完“区”后自动保存；{ui.running ? "下轮监控会更新送货日期。" : "启动监控后会查询送货日期。"}
+                    </p>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 shrink-0 rounded-lg px-2 text-muted-foreground"
+                      disabled={deliverySaving || (!ui.settings.deliveryRegion && !deliveryDirty)}
+                      onClick={async () => {
+                        setDeliverySaving(true);
+                        const saved = await saveSettings({ deliveryRegion: null });
+                        if (saved) {
+                          setDeliveryDraft({ state: "", city: "", district: "" });
+                          setDeliveryDirty(false);
+                          setDeliveryError(null);
+                        } else {
+                          setDeliveryError("清除送货地区失败，请稍后重试。");
+                        }
+                        setDeliverySaving(false);
+                      }}
+                    >
+                      清除
+                    </Button>
+                  </div>
+                  {deliveryError ? (
+                    <p role="alert" className="text-[11px] leading-4 text-destructive">{deliveryError}</p>
+                  ) : null}
                 </div>
 
                 <div className="mt-3 field-group">

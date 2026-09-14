@@ -31,6 +31,9 @@ export interface Target {
   storeTitle: string;
   partNumber: string;
   productName: string;
+  companionPart?: string;
+  companionName?: string;
+  kitPart?: string;
 }
 
 export interface PickupDetails {
@@ -74,6 +77,38 @@ export interface Product {
   capacity: string;
   color: string;
   title: string;
+  companionPart?: string;
+  kitPart?: string;
+  watchCaseSize?: string;
+}
+
+export interface WatchBandChoice {
+  styleKey: string;
+  styleName: string;
+  colorKey: string;
+  colorName: string;
+}
+
+export interface WatchBandSize {
+  partNumber: string;
+  text: string;
+}
+
+export interface DeliveryRegion {
+  state: string;
+  city: string;
+  district: string;
+}
+
+export interface DeliveryLocalityOption {
+  text: string;
+  value: string;
+}
+
+export interface DeliveryLocalities {
+  states: DeliveryLocalityOption[];
+  cities: DeliveryLocalityOption[];
+  districts: DeliveryLocalityOption[];
 }
 
 export interface Store {
@@ -88,6 +123,7 @@ export type OpenOnHit = "none" | "bag" | "product";
 export interface Settings {
   locale: string;
   targets: Target[];
+  deliveryRegion: DeliveryRegion | null;
   intervalSeconds: number;
   /** 按商品零件号覆盖默认 Bark；同一型号在不同门店共用。 */
   productBarkUrls: Record<string, string>;

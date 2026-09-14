@@ -17,6 +17,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Category,
   CategoryOption,
+  DeliveryLocalities,
   Product,
   Region,
   Settings,
@@ -25,6 +26,8 @@ import type {
   TargetState,
   Trouble,
   UpdateInfo,
+  WatchBandChoice,
+  WatchBandSize,
   WatcherEvent,
 } from "./types";
 import { assertNever } from "./types";
@@ -70,6 +73,7 @@ export interface UiState {
 const DEFAULT_SETTINGS: Settings = {
   locale: "zh_CN",
   targets: [],
+  deliveryRegion: null,
   intervalSeconds: 30,
   barkUrl: "",
   productBarkUrls: {},
@@ -253,6 +257,39 @@ export async function loadCatalog(locale: string): Promise<void> {
   }
 }
 
+/** 从 Apple 官网读取送货地区的三级联动选项。 */
+export function loadDeliveryLocalities(
+  locale: string,
+  selectedState = "",
+  selectedCity = "",
+): Promise<DeliveryLocalities> {
+  return invoke<DeliveryLocalities>("list_delivery_localities", {
+    locale,
+    stateName: selectedState,
+    cityName: selectedCity,
+  });
+}
+
+/** 从 Apple 官网读取指定 Watch 表壳可搭配的表带款式与颜色。 */
+export function loadWatchBandChoices(locale: string, casePart: string): Promise<WatchBandChoice[]> {
+  return invoke<WatchBandChoice[]>("list_watch_band_choices", { locale, casePart });
+}
+
+/** 从 Apple 官网读取指定表带款式、颜色的尺码与精确零件号。 */
+export function loadWatchBandSizes(
+  locale: string,
+  casePart: string,
+  styleKey: string,
+  colorKey: string,
+): Promise<WatchBandSize[]> {
+  return invoke<WatchBandSize[]>("list_watch_band_sizes", {
+    locale,
+    casePart,
+    styleKey,
+    colorKey,
+  });
+}
+
 // 所有修改设置的命令按顺序执行，查询间隔和目标列表也不能被旧设置覆盖。
 let settingsWrite: Promise<unknown> = Promise.resolve();
 
@@ -262,15 +299,17 @@ function enqueueSettingsWrite<T>(operation: () => Promise<T>): Promise<T> {
   return next;
 }
 
-export function saveSettings(patch: Partial<Settings>): Promise<void> {
+export function saveSettings(patch: Partial<Settings>): Promise<boolean> {
   return enqueueSettingsWrite(async () => {
     try {
       const saved = await invoke<Settings>("save_settings", {
         settings: { ...state.settings, ...patch },
       });
       update({ settings: saved });
+      return true;
     } catch (err) {
       pushLog(`保存设置失败：${String(err)}`);
+      return false;
     }
   });
 }

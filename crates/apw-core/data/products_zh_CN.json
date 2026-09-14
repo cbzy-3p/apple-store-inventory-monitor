@@ -2992,6 +2992,8 @@
     "category": "watch",
     "family": "apple-watch",
     "data": {
+      "companionPart": "MJUY4FE/A",
+      "kitPart": "Z0YQ",
       "products": [
         {
           "part": "MJF54CH/B",
@@ -3369,6 +3371,8 @@
     "category": "watch",
     "family": "apple-watch-se",
     "data": {
+      "companionPart": "MJVK4FE/A",
+      "kitPart": "Z0YQ",
       "products": [
         {
           "part": "MEHW4CH/B",
@@ -3573,6 +3577,8 @@
     "category": "watch",
     "family": "apple-watch-ultra",
     "data": {
+      "companionPart": "MKDY4FE/A",
+      "kitPart": "Z0YQ",
       "products": [
         {
           "part": "MJCW4CH/B",
@@ -3687,6 +3693,8 @@
     "category": "watch",
     "family": "apple-watch-hermes",
     "data": {
+      "companionPart": "MJN94FE/A",
+      "kitPart": "Z0YQ",
       "products": [
         {
           "part": "MJKL4CH/B",
@@ -3795,6 +3803,8 @@
     "category": "watch",
     "family": "apple-watch-hermes-ultra",
     "data": {
+      "companionPart": "ML414FE/A",
+      "kitPart": "Z0YQ",
       "products": [
         {
           "part": "MJE04CH/B",

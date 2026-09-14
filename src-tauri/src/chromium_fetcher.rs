@@ -8,6 +8,7 @@
 //! 这个实现不会读取用户现有 Chrome 的个人资料、Cookie 或浏览记录。临时目录随
 //! 会话销毁，浏览器进程也由应用持有并在退出时终止。
 
+use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use apw_core::apple::{ApiError, Fetcher, StoreAvailability, parse_pickup_message};
-use apw_core::model::Region;
+use apw_core::model::{DeliveryRegion, Region, Target};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,6 +35,7 @@ const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RESPONSE_BYTES: usize = 4 << 20;
 const FALLBACK_CHROMIUM_MAJOR: u32 = 152;
 const MAX_EXCEPTION_SUMMARY_CHARS: usize = 160;
+const DELIVERY_CACHE_TTL: Duration = Duration::from_secs(60);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -53,6 +55,7 @@ struct ChromiumSession {
     next_command_id: u64,
     locale: Option<&'static str>,
     last_inventory_request: Option<Instant>,
+    delivery_cache: HashMap<String, (Instant, Option<String>)>,
 }
 
 impl Drop for ChromiumSession {
@@ -154,6 +157,7 @@ impl ChromiumSession {
             next_command_id: 1,
             locale: None,
             last_inventory_request: None,
+            delivery_cache: HashMap::new(),
         })
     }
 
@@ -267,6 +271,7 @@ impl ChromiumSession {
         region: &'static Region,
         store_number: &str,
         parts: &[String],
+        delivery_region: Option<&DeliveryRegion>,
     ) -> Result<BrowserPayload, ApiError> {
         self.ensure_region(region).await?;
 
@@ -293,6 +298,13 @@ impl ChromiumSession {
                 .map(|(index, part)| (format!("parts.{index}"), part.clone())),
         );
         pairs.push(("store".to_string(), store_number.to_string()));
+        if let Some(location) = delivery_region {
+            pairs.extend([
+                ("state".to_string(), location.state.clone()),
+                ("city".to_string(), location.city.clone()),
+                ("district".to_string(), location.district.clone()),
+            ]);
+        }
 
         #[derive(Serialize)]
         struct BrowserRequest<'a> {
@@ -328,6 +340,140 @@ impl ChromiumSession {
         serde_json::from_value(value)
             .map_err(|e| ApiError::Transport(format!("Chromium 库存结果无法解析：{e}")))
     }
+
+    async fn fetch_watch_delivery(
+        &mut self,
+        region: &'static Region,
+        target: &Target,
+        location: &DeliveryRegion,
+    ) -> Result<Option<String>, ApiError> {
+        let (Some(kit), Some(companion)) = (
+            target
+                .kit_part
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            target
+                .companion_part
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        ) else {
+            return Ok(None);
+        };
+        let key = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            region.locale,
+            kit,
+            target.part_number,
+            companion,
+            location.state,
+            location.city,
+            location.district
+        );
+        if let Some((at, message)) = self.delivery_cache.get(&key)
+            && at.elapsed() < DELIVERY_CACHE_TTL
+        {
+            return Ok(message.clone());
+        }
+
+        if let Some(last) = self.last_inventory_request {
+            let elapsed = last.elapsed();
+            if elapsed < MIN_REQUEST_INTERVAL {
+                tokio::time::sleep(MIN_REQUEST_INTERVAL - elapsed).await;
+            }
+        }
+        self.last_inventory_request = Some(Instant::now());
+
+        let pairs = vec![
+            ("fae".to_string(), "true".to_string()),
+            ("pl".to_string(), "true".to_string()),
+            ("fts".to_string(), "true".to_string()),
+            ("mts.0".to_string(), "expanded".to_string()),
+            ("parts.0".to_string(), kit.to_string()),
+            (
+                "option.0".to_string(),
+                format!("{},{}", target.part_number, companion),
+            ),
+            ("state".to_string(), location.state.clone()),
+            ("city".to_string(), location.city.clone()),
+            ("district".to_string(), location.district.clone()),
+        ];
+
+        #[derive(Serialize)]
+        struct BrowserRequest<'a> {
+            url: String,
+            pairs: &'a [(String, String)],
+            max_bytes: usize,
+        }
+        let request = serde_json::to_string(&BrowserRequest {
+            url: region.pickup_message_url(),
+            pairs: &pairs,
+            max_bytes: MAX_RESPONSE_BYTES,
+        })
+        .map_err(|e| ApiError::Transport(format!("无法编码 Watch 送货请求：{e}")))?;
+        let expression = format!(
+            r#"(async()=>{{
+                const request={request};
+                const url=new URL(request.url);
+                for(const [key,value] of request.pairs) url.searchParams.append(key,value);
+                const response=await fetch(url.toString(),{{
+                    credentials:'same-origin',
+                    headers:{{'Accept':'application/json, text/javascript, */*; q=0.01','X-Requested-With':'XMLHttpRequest'}}
+                }});
+                const body=await response.text();
+                const bytes=new TextEncoder().encode(body).length;
+                if(bytes>request.max_bytes) return {{status:0,body:'Apple 响应超过 4 MiB 安全上限'}};
+                return {{status:response.status,body}};
+            }})()"#
+        );
+        let value = self.evaluate(&expression, true).await?;
+        let payload: BrowserPayload = serde_json::from_value(value)
+            .map_err(|e| ApiError::Transport(format!("Chromium Watch 送货结果无法解析：{e}")))?;
+        let message = match payload.status {
+            200 => parse_delivery_display_name(payload.body.as_bytes())?,
+            403 | 541 => return Err(ApiError::Blocked(format!("HTTP {}", payload.status))),
+            429 => return Err(ApiError::RateLimited("HTTP 429".into())),
+            status if status >= 500 => return Err(ApiError::RateLimited(format!("HTTP {status}"))),
+            0 => {
+                return Err(ApiError::Transport(
+                    payload.body.chars().take(300).collect(),
+                ));
+            }
+            status => return Err(ApiError::Transport(format!("HTTP {status}"))),
+        };
+        self.delivery_cache
+            .insert(key, (Instant::now(), message.clone()));
+        Ok(message)
+    }
+}
+
+fn parse_delivery_display_name(raw: &[u8]) -> Result<Option<String>, ApiError> {
+    let value: Value = serde_json::from_slice(raw).map_err(|e| ApiError::SchemaDrift {
+        field: "body.content.deliveryMessage".into(),
+        raw: format!("Watch 送货响应不是 JSON：{e}"),
+    })?;
+    fn find(value: &Value) -> Option<String> {
+        if let Some(message) = value
+            .get("deliveryOptionMessages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.first())
+            .and_then(|message| message.get("displayName"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        {
+            return Some(message.to_string());
+        }
+        match value {
+            Value::Array(items) => items.iter().find_map(find),
+            Value::Object(fields) => fields.values().find_map(find),
+            _ => None,
+        }
+    }
+    Ok(value
+        .pointer("/body/content/deliveryMessage")
+        .and_then(find))
 }
 
 fn chromium_exception_summary(details: &Value) -> String {
@@ -460,13 +606,26 @@ impl AppleChromiumFetcher {
         &self,
         region: &'static Region,
         store_number: &str,
-        parts: &[String],
+        targets: &[Target],
+        delivery_region: Option<&DeliveryRegion>,
     ) -> Result<StoreAvailability, ApiError> {
         if store_number.is_empty() {
             return Err(ApiError::Transport("门店编号为空".into()));
         }
-        if parts.is_empty() {
+        if targets.is_empty() {
             return Err(ApiError::Transport("零件号列表为空".into()));
+        }
+        let mut parts: Vec<String> = targets
+            .iter()
+            .map(|target| target.part_number.clone())
+            .collect();
+        for companion in targets
+            .iter()
+            .filter_map(|target| target.companion_part.as_ref())
+        {
+            if !parts.contains(companion) {
+                parts.push(companion.clone());
+            }
         }
 
         // 一把锁覆盖整个浏览器命令往返。监控引擎可以并发调多个门店，但同一个
@@ -478,7 +637,7 @@ impl AppleChromiumFetcher {
         let fetched = guard
             .as_mut()
             .expect("刚初始化的 Chromium 会话应当存在")
-            .fetch(region, store_number, parts)
+            .fetch(region, store_number, &parts, delivery_region)
             .await;
         let payload = match fetched {
             Ok(payload) => payload,
@@ -503,7 +662,39 @@ impl AppleChromiumFetcher {
                 {
                     return Err(ApiError::Blocked("HTTP 200 但响应不是 JSON".into()));
                 }
-                parse_pickup_message(bytes, store_number)
+                let mut availability = parse_pickup_message(bytes, store_number)?;
+                if let Some(location) = delivery_region {
+                    let mut reset_session = false;
+                    for target in targets.iter().filter(|target| target.kit_part.is_some()) {
+                        match guard
+                            .as_mut()
+                            .expect("查询期间 Chromium 会话应当存在")
+                            .fetch_watch_delivery(region, target, location)
+                            .await
+                        {
+                            Ok(Some(message)) => {
+                                if let Some(status) =
+                                    availability.parts.get_mut(&target.part_number)
+                                    && let Some(details) = status.pickup_details.as_mut()
+                                {
+                                    details.sale_message = Some(message);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                // 送货是附加信息，失败不能抹掉已经拿到的门店库存结论。
+                                // 保留取货响应里的粗略文案，下轮自动重试精确送货。
+                                eprintln!("Watch 送货查询失败（{}）：{error}", target.part_number);
+                                reset_session |=
+                                    matches!(error, ApiError::Blocked(_) | ApiError::Transport(_));
+                            }
+                        }
+                    }
+                    if reset_session {
+                        *guard = None;
+                    }
+                }
+                Ok(availability)
             }
             403 | 541 => {
                 // 当前浏览器会话已经被拒绝。直接销毁临时资料与进程；下一轮会用
@@ -526,9 +717,11 @@ impl Fetcher for AppleChromiumFetcher {
         &self,
         region: &'static Region,
         store_number: &str,
-        parts: &[String],
+        targets: &[Target],
+        delivery_region: Option<&DeliveryRegion>,
     ) -> Result<StoreAvailability, ApiError> {
-        self.pickup(region, store_number, parts).await
+        self.pickup(region, store_number, targets, delivery_region)
+            .await
     }
 }
 
@@ -536,6 +729,19 @@ impl Fetcher for AppleChromiumFetcher {
 mod tests {
     use super::*;
     use apw_core::model::region_by_locale;
+
+    fn test_target(part: &str) -> Target {
+        Target {
+            locale: "zh_CN".into(),
+            store_number: "R390".into(),
+            store_title: "上海-香港广场".into(),
+            part_number: part.into(),
+            product_name: part.into(),
+            companion_part: None,
+            companion_name: None,
+            kit_part: None,
+        }
+    }
 
     /// 模拟浏览器的 CDP 边界，不启动 Chromium，也不访问 Apple。
     async fn cdp_fixture(response: Value) -> (AppleChromiumFetcher, tokio::task::JoinHandle<bool>) {
@@ -570,6 +776,7 @@ mod tests {
             next_command_id: 1,
             locale: Some("zh_CN"),
             last_inventory_request: None,
+            delivery_cache: HashMap::new(),
         };
         (
             AppleChromiumFetcher {
@@ -589,7 +796,8 @@ mod tests {
             .pickup_message(
                 region_by_locale("zh_CN").unwrap(),
                 "R390",
-                &["MG6X4CH/A".to_string()],
+                &[test_target("MG6X4CH/A")],
+                None,
             )
             .await;
         assert!(matches!(result, Err(ApiError::Transport(_))));
@@ -610,7 +818,8 @@ mod tests {
                 .pickup_message(
                     region_by_locale("zh_CN").unwrap(),
                     "R390",
-                    &["MG6X4CH/A".to_string()],
+                    &[test_target("MG6X4CH/A")],
+                    None,
                 )
                 .await;
             if status == 429 {
@@ -633,6 +842,17 @@ mod tests {
             serde_json::from_value(json!({"status": 200, "body": "{}"})).unwrap();
         assert_eq!(payload.status, 200);
         assert_eq!(payload.body, "{}");
+    }
+
+    #[test]
+    fn watch整表送货响应提取精确日期() {
+        let raw = r#"{"body":{"content":{"deliveryMessage":{"Z0YQ":{"regular":{"deliveryOptionMessages":[{"displayName":"2026/09/25 – 2026/09/30 — 免费"}]}}}}}}"#;
+        assert_eq!(
+            parse_delivery_display_name(raw.as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some("2026/09/25 – 2026/09/30 — 免费")
+        );
     }
 
     #[test]
@@ -694,19 +914,18 @@ mod tests {
     async fn 真实chromium会话连续检查四家门店两轮() {
         let region = region_by_locale("zh_CN").expect("应当有中国大陆地区配置");
         let fetcher = AppleChromiumFetcher::new();
-        let part = vec!["MG6X4CH/A".to_string()];
+        let part = vec![test_target("MG6X4CH/A")];
         let stores = ["R390", "R401", "R581", "R683"];
 
         for round in 1..=2 {
             for store in stores {
                 let result = fetcher
-                    .pickup(region, store, &part)
+                    .pickup(region, store, &part, None)
                     .await
                     .unwrap_or_else(|error| panic!("第 {round} 轮门店 {store} 查询失败：{error}"));
-                let status = result
-                    .parts
-                    .get(&part[0])
-                    .unwrap_or_else(|| panic!("第 {round} 轮门店 {store} 响应缺少 {}", part[0]));
+                let status = result.parts.get(&part[0].part_number).unwrap_or_else(|| {
+                    panic!("第 {round} 轮门店 {store} 响应缺少 {}", part[0].part_number)
+                });
                 assert_eq!(result.store_number, store);
                 assert!(
                     !status.availability.is_unknown(),
@@ -728,11 +947,11 @@ mod tests {
     async fn 真实apple_watch配置型号首轮可以查询() {
         let region = region_by_locale("zh_CN").expect("应当有中国大陆地区配置");
         let fetcher = AppleChromiumFetcher::new();
-        let part = vec!["MEP24CH/B".to_string()];
+        let part = vec![test_target("MEP24CH/B")];
 
         let result = tokio::time::timeout(
             Duration::from_secs(35),
-            fetcher.pickup(region, "R390", &part),
+            fetcher.pickup(region, "R390", &part, None),
         )
         .await
         .expect("首轮查询不应再等待 50 秒握手超时")
@@ -740,10 +959,72 @@ mod tests {
 
         let status = result
             .parts
-            .get(&part[0])
+            .get(&part[0].part_number)
             .expect("响应应包含请求的 Apple Watch 零件号");
         assert!(!status.availability.is_unknown());
     }
+
+    #[tokio::test]
+    #[ignore = "需要本机 Chromium 与 Apple 官网网络"]
+    async fn 真实apple_watch套件能按省市区查询精确送货日期() {
+        let region = region_by_locale("zh_CN").unwrap();
+        let fetcher = AppleChromiumFetcher::new();
+        let mut target = test_target("MJCX4CH/B");
+        target.companion_part = Some("MKDY4FE/A".into());
+        target.kit_part = Some("Z0YQ".into());
+        let destination = DeliveryRegion {
+            state: "上海".into(),
+            city: "上海".into(),
+            district: "黄浦区".into(),
+        };
+        let result = fetcher
+            .pickup(region, "R390", &[target.clone()], Some(&destination))
+            .await
+            .expect("Watch 套件查询应成功");
+        let message = result
+            .parts
+            .get(&target.part_number)
+            .and_then(|status| status.pickup_details.as_ref())
+            .and_then(|details| details.sale_message.as_deref())
+            .expect("Watch 套件应返回送货日期");
+        assert!(
+            message.contains("2026/"),
+            "应为精确日期而不是周范围：{message}"
+        );
+    }
+
+    /// 用户界面回归：Series 12 表壳必须和页面默认表带组成套件后再查送货，
+    /// 否则取货接口只会留下“2-3 周”这种不精确的通用文案。
+    #[tokio::test]
+    #[ignore = "需要本机 Chromium 与 Apple 官网网络"]
+    async fn 真实series_12默认表带能按浦东新区查询精确送货日期() {
+        let region = region_by_locale("zh_CN").unwrap();
+        let fetcher = AppleChromiumFetcher::new();
+        let mut target = test_target("MJK44CH/B");
+        target.companion_part = Some("MJUY4FE/A".into());
+        target.kit_part = Some("Z0YQ".into());
+        let destination = DeliveryRegion {
+            state: "上海".into(),
+            city: "上海".into(),
+            district: "浦东新区".into(),
+        };
+        let result = fetcher
+            .pickup(region, "R683", &[target.clone()], Some(&destination))
+            .await
+            .expect("Series 12 套件查询应成功");
+        let message = result
+            .parts
+            .get(&target.part_number)
+            .and_then(|status| status.pickup_details.as_ref())
+            .and_then(|details| details.sale_message.as_deref())
+            .expect("Series 12 套件应返回送货日期");
+        eprintln!("Series 12 浦东新区送货：{message}");
+        assert!(
+            message.contains("2026/"),
+            "应为精确日期而不是周范围：{message}"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "现场只读诊断，需要本机 Chromium 与 Apple 官网网络"]
     async fn diagnose_missing_store_response() {
@@ -756,7 +1037,7 @@ mod tests {
             ("R683", "MJYH4CH/A"),
         ] {
             let payload = session
-                .fetch(region, store, &[part.to_string()])
+                .fetch(region, store, &[part.to_string()], None)
                 .await
                 .unwrap();
             println!("store={store} part={part} http={}", payload.status);
@@ -794,7 +1075,7 @@ mod tests {
         ];
         for (name, parts) in batches {
             let parts: Vec<_> = parts.iter().map(|p| p.to_string()).collect();
-            let payload = session.fetch(region, "R359", &parts).await.unwrap();
+            let payload = session.fetch(region, "R359", &parts, None).await.unwrap();
             println!(
                 "case={name} requested={parts:?} status={} parsed={:?}",
                 payload.status,
